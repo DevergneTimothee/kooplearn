@@ -447,3 +447,4 @@ class LangevinTripleWell1D(DiscreteTimeDynamics):
                 self._eigfun_sign_phase(estimated * density, true * density) * estimated
             )
         return LinalgDecomposition(evd.values, phase_aligned_funcs)
+

@@ -6,6 +6,7 @@ from scipy.linalg import LinAlgError, eig, eigh, lstsq, pinvh
 from scipy.sparse.linalg import eigs, eigsh, lsqr
 from scipy.sparse.linalg._eigen.arpack.arpack import IterInv
 from sklearn.utils.extmath import randomized_svd
+from scipy.sparse.linalg import LinearOperator
 
 from kooplearn._src.linalg import _rank_reveal, modified_QR, weighted_norm
 from kooplearn._src.utils import fuzzy_parse_complex, topk
@@ -22,7 +23,7 @@ def regularize(M: np.ndarray, reg: float):
         np.ndarray: Regularized matrix.
     """
     return M + reg * M.shape[0] * np.identity(M.shape[0], dtype=M.dtype)
-
+    #return M + reg  * np.identity(M.shape[0], dtype=M.dtype)
 
 def fit_reduced_rank_regression(
     K_X: np.ndarray,  # Kernel matrix of the input data
@@ -53,9 +54,9 @@ def fit_reduced_rank_regression(
         # Prefer svd_solver == 'randomized' in such a case.
         if svd_solver == "arnoldi":
             # Adding a small buffer to the Arnoldi-computed eigenvalues.
-            sigma_sq, U = eigs(K, rank + 3, regularize(K_X, tikhonov_reg))
+            sigma_sq, U = eigsh(K, rank + 3, regularize(K_X, tikhonov_reg))
         else:  # 'full'
-            sigma_sq, U = eig(K, regularize(K_X, tikhonov_reg))
+            sigma_sq, U = eigh(K, regularize(K_X, tikhonov_reg))
 
         max_imag_part = np.max(U.imag)
         if max_imag_part >= 10.0 * U.shape[0] * np.finfo(U.dtype).eps:
@@ -212,7 +213,83 @@ def fit_rand_reduced_rank_regression(
         return U.real, V.real, sigma_sq
     else:
         return U.real, V.real
+class CustomOperator(LinearOperator):
+    def __init__(self, K, M, eta):
+        self.K = K
+        self.M = M
+        self.eta = eta
+        self.shape = K.shape
+        self.dtype = K.dtype
+    def _matvec(self, v):
+        # Perform the operation: eta*v - scipy.lstsq(K, M@v)
+        lstsq_result = lstsq(self.K, self.M @ v)
+        inter = self.eta * v - lstsq_result[0]
+        solution = self.eta * inter  - self.M @ lstsq(self.K, v)[0]
+        return solution
 
+    def _rmatvec(self, v):
+    # Perform the adjoint operation: eta*v - scipy.lstsq(K.T, M.T @ v)
+        lstsq_result = lstsq(self.K.T, self.M.T @ v)
+        solution = self.eta * v - lstsq_result[0] - self.K.T @ lstsq(self.M.T, v)[0]
+        return solution
+    
+def fit_reduced_rank_regression_generator(
+    K_X: np.ndarray,  # Kernel matrix of the input data
+    M: np.ndarray,
+    tikhonov_reg: float = 0.0,  # Tikhonov regularization parameter, can be zero
+    eta: float=0.0,
+    rank: Optional[int] = None,  # Rank of the estimator
+    svd_solver: str = "arnoldi",  # Solver for the generalized eigenvalue problem. 'arnoldi' or 'full'
+) -> tuple[np.ndarray, np.ndarray]:
+    dim = K_X.shape[0]
+
+    if rank is None:
+        rank = dim
+    assert rank <= dim, f"Rank too high. The maximum value for this problem is {dim}"
+    reg_K_X = regularize(K_X, tikhonov_reg)
+    operator = CustomOperator(reg_K_X,M,eta)
+
+ 
+    values, vectors = eigsh(reg_K_X,M=operator, k=rank + 3)
+
+    
+    vectors, values, rsqrt_values = _rank_reveal(values, vectors, rank)
+
+    V = vectors
+
+    U = lstsq(eta*np.identity(dim) - np.linalg.inv(reg_K_X)@M,V)[0]
+ 
+    return U,V
+
+
+def fit_principal_component_regression_generator(
+    K_X: np.ndarray,  # Kernel matrix of the input data
+    M: np.ndarray,
+    tikhonov_reg: float = 0.0,  # Tikhonov regularization parameter, can be zero
+    eta: float=0.0,
+    rank: Optional[int] = None,  # Rank of the estimator
+    svd_solver: str = "arnoldi",  # Solver for the generalized eigenvalue problem. 'arnoldi' or 'full'
+) -> tuple[np.ndarray, np.ndarray]:
+    dim = K_X.shape[0]
+
+    if rank is None:
+        rank = dim
+    assert rank <= dim, f"Rank too high. The maximum value for this problem is {dim}"
+    reg_K_X = regularize(K_X, tikhonov_reg)
+    if svd_solver == "arnoldi":
+        values, vectors = eigsh(reg_K_X, k=rank + 3)
+    elif svd_solver == "full":
+        values, vectors = eigh(reg_K_X)
+    else:
+        raise ValueError(f"Unknown svd_solver {svd_solver}")
+    
+    vectors, values, rsqrt_values = _rank_reveal(values, vectors, rank)
+
+    vectors = np.sqrt(dim)*vectors@np.diag(rsqrt_values)
+
+    V = lstsq(eta*reg_K_X-M,vectors)[0]
+
+    return vectors, V*np.sqrt(dim)
 
 def fit_principal_component_regression(
     K_X: np.ndarray,  # Kernel matrix of the input data
@@ -234,6 +311,7 @@ def fit_principal_component_regression(
         raise ValueError(f"Unknown svd_solver {svd_solver}")
     vectors, values, rsqrt_values = _rank_reveal(values, vectors, rank)
     vectors = np.sqrt(dim) * vectors @ np.diag(rsqrt_values)
+
     return vectors, vectors
 
 
@@ -306,8 +384,8 @@ def estimator_eig(
     K_YX: np.ndarray,  # Kernel matrix between the output data and the input data
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     # SUV.TZ -> V.T K_YX U (right ev = SUvr, left ev = ZVvl)
-    r_dim = (K_X.shape[0]) ** (-1)
-
+    r_dim = (K_X.shape[0]) ** (-0.5)
+    #r_dim = 1.0
     W_YX = np.linalg.multi_dot([V.T, r_dim * K_YX, U])
     W_X = np.linalg.multi_dot([U.T, r_dim * K_X, U])
 
@@ -347,6 +425,7 @@ def evaluate_eigenfunction(
     vr_or_vl: np.ndarray,  # Right eigenvectors or left eigenvectors, as returned by the estimator_eig function
 ):
     rsqrt_dim = (K_Xin_X_or_Y.shape[1]) ** (-0.5)
+    #rsqrt_dim = 1.0
     return np.linalg.multi_dot([rsqrt_dim * K_Xin_X_or_Y, vr_or_vl])
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Callable, Optional
 
 import numpy as np
@@ -15,6 +16,7 @@ from kooplearn._src.serialization import pickle_load, pickle_save
 from kooplearn._src.utils import ShapeError, check_contexts_shape, check_is_fitted
 from kooplearn.abc import BaseModel
 
+logger = logging.getLogger("kooplearn")
 
 class KernelDMD(BaseModel, RegressorMixin):
     """
@@ -26,7 +28,7 @@ class KernelDMD(BaseModel, RegressorMixin):
         reduced_rank (bool): If ``True`` initializes the reduced rank estimator introduced in :footcite:t:`Kostic2022`, if ``False`` initializes the classical principal component estimator.
         rank (int): Rank of the estimator. Defaults to 5.
         tikhonov_reg (float): Tikhonov regularization coefficient. ``None`` is equivalent to ``tikhonov_reg = 0``, and internally calls specialized stable algorithms to deal with this specific case.
-        svd_solver (str): Solver used to perform the internal SVD calcuations. Currently supported: `full`, uses LAPACK solvers, `arnoldi`, uses ARPACK solvers, `randomized`, uses randomized SVD algorithms as described in :guilabel:`TODO - ADD REF`.
+        svd_solver (str): Solver used to perform the internal SVD calcuations. Currently supported: `full`, uses LAPACK solvers, `arnoldi`, uses ARPACK solvers, `randomized`, uses randomized SVD algorithms as described in :footcite:t:`Turri2023`.
         iterated_power (int): Number of power iterations when using a randomized algorithm (``svd_solver == 'randomized'``).
         n_oversamples (int): Number of oversamples when using a randomized algorithm (``svd_solver == 'randomized'``).
         optimal_sketching (bool): Sketching strategy for the randomized solver. If `True` performs optimal sketching (computaitonally expensive but more accurate).
@@ -52,7 +54,7 @@ class KernelDMD(BaseModel, RegressorMixin):
         reduced_rank: bool = True,
         rank: int = 5,
         tikhonov_reg: Optional[float] = None,
-        svd_solver: str = "full",
+        svd_solver: str = "arnoldi",
         iterated_power: int = 1,
         n_oversamples: int = 5,
         optimal_sketching: bool = False,
@@ -166,6 +168,8 @@ class KernelDMD(BaseModel, RegressorMixin):
                 )
         self.U = U
         self.V = V
+
+        
 
         # Final Checks
         check_is_fitted(
@@ -387,6 +391,15 @@ class KernelDMD(BaseModel, RegressorMixin):
 
         if hasattr(self, "_eig_cache"):
             del self._eig_cache
+        self._check_rank(self.kernel_X.shape[0])
+
+    def _check_rank(self, n_samples):
+        if not isinstance(self.rank, int) or self.rank < 1:
+            raise ValueError("rank must be a positive integer.")
+        if self.rank > n_samples:
+            raise ValueError(
+                f"rank must be less than the number of samples ({n_samples})."
+            )
 
     def save(self, filename):
         """Serialize the model to a file.
@@ -407,3 +420,156 @@ class KernelDMD(BaseModel, RegressorMixin):
             KernelDMD: The loaded model.
         """
         return pickle_load(cls, filename)
+
+class KernelGenerator(KernelDMD):
+
+    def __init__(
+        self,
+        kernel: Kernel = DotProduct(),
+        reduced_rank: bool = True,
+        rank: int = 5,
+        tikhonov_reg: Optional[float] = None,
+        svd_solver: str = "full",
+        iterated_power: int = 1,
+        n_oversamples: int = 5,
+        optimal_sketching: bool = False,
+        rng_seed: Optional[int] = None,
+    ):
+        super().__init__(kernel,reduced_rank,rank,tikhonov_reg,svd_solver,iterated_power,n_oversamples,optimal_sketching,rng_seed)
+    def fit(self, data: np.ndarray, verbose: bool = True,  forces=None, friction=None,bias=None, beta=1.0) -> KernelGenerator:
+        #self.weights = weights
+        self.bias = bias
+        self.beta = beta
+        self._pre_fit_checks(data)
+        #if weights is not None:
+        #    w_matrix = self._build_weights(weights)
+        #    self.kernel_X*=w_matrix
+        #print(w_matrix)
+        self._build_matrices(data,forces,friction)
+
+        super().fit(data, verbose)
+
+        #if weights is not None:
+        #    w_matrix = self._build_weights(weights)
+        #    self.kernel_X*=w_matrix
+        return self
+
+
+
+    
+    def _init_kernels(self, X: np.ndarray, Y: np.ndarray):
+
+        K_X = self.kernel(X)
+        return K_X
+    def kernel(self, X: np.ndarray, Y: Optional[np.ndarray] = None) -> np.ndarray:
+        X = X.reshape(X.shape[0], -1)
+        if Y is not None:
+            Y = Y.reshape(Y.shape[0], -1)
+        if self.bias is not None:
+            if Y is not None:
+                exp = 1.0 #np.exp(self.beta * (self.bias(X).reshape(-1,1)+self.bias(Y).reshape(1,-1))/2).reshape(X.shape[0],Y.shape[0])
+            else:
+                exp = np.exp(self.beta * (self.bias(X)[:,np.newaxis]+self.bias(X))/2).reshape(X.shape[0],X.shape[0])
+        else:
+            exp =1.0
+        return self._kernel(X, Y)*exp
+    def _build_weights(self,weights):
+        weights_b, weights_a = contexts_to_markov_train_states(weights, self.lookback_len)
+        weights_b=weights_b.reshape(-1)
+        return np.einsum("i,j->ij",weights_b,weights_b)
+
+    
+    def _build_matrices(self, data, forces, friction):
+        self.kernel_Y = self.return_dk(data, forces, friction) 
+        self.kernel_YX  = self.return_mixed_term(data, forces,friction)
+    
+    def _pre_fit_checks(self, data: np.ndarray) -> None:
+        """Performs pre-fit checks on the training data.
+
+        Use :func:`check_contexts_shape` to check and sanitize the input data, initialize the kernel matrices and saves the training data.
+
+        Args:
+            data (np.ndarray): Batch of context windows of shape ``(n_samples, context_len, *features_shape)``.
+        """
+        lookback_len = data.shape[1] - 1
+        check_contexts_shape(data, lookback_len)
+        data = np.asanyarray(data)
+        # Save the lookback length as a private attribute of the model
+        self._lookback_len = lookback_len
+        X_fit, Y_fit = contexts_to_markov_train_states(data, self.lookback_len)
+
+        self.kernel_X = self._init_kernels(X_fit,Y_fit)
+        self.data_fit = data
+
+        if hasattr(self, "_eig_cache"):
+            del self._eig_cache
+
+    def return_dk(self, data, forces: np.ndarray, friction: np.float):
+        """ Computes the dot product between the second order derivatives"""
+        sigma = self._kernel.length_scale
+        X, Y_fit = contexts_to_markov_train_states(data, self.lookback_len)
+        X = X.reshape(X.shape[0],-1)
+        kern=self._kernel(X,X)
+        forces, Y_fit = contexts_to_markov_train_states(forces, self.lookback_len)
+        forces = forces.reshape(forces.shape[0],-1)
+
+        difference = (X[:, np.newaxis, :] - X[np.newaxis, :, :])
+        n =  difference.shape[2]
+        off_diag = np.ones((n,n)) - np.eye(n)
+
+        #Computation of the first term of the dot product
+        dk_1 = (-np.einsum('ijk,ijl,ik,jl->ij', difference, difference, forces, forces) / sigma**4 
+                + np.einsum("ik,jk->ij",forces,forces)/sigma**2) #first term in the dot product the /sigma**2 comes from the case i=j
+        
+        #Computation of the second "square" term in the dot product, had to use a trick to treat the special case when i=j (see last appendix Houe 2023)
+        
+        first_term = (np.einsum('ijk,ijl,kl->ij', difference**2,(difference/ sigma)**2 - 1,off_diag)
+                      +np.einsum('ijk,ijk->ij', (difference/ sigma)**2 - 6, difference**2)) / sigma**6 # add the diagonal term
+        
+
+        second_term = n*(n+2)/sigma**4
+        third_term = np.einsum('ijk,lk->ij',difference**2/sigma**6,off_diag) #same here
+        
+
+        ct_2 =  0.5 * (np.einsum("ijk,ijl,jl, kl->ij",(difference/sigma)**2-1, difference, forces, off_diag) 
+                      + np.einsum("ijk,ijk,jk->ij",(difference/sigma)**2-3, difference, forces)) * friction / sigma**4 
+
+        return (dk_1 + (first_term + second_term - third_term)*friction**2/4 + 2* ct_2)*self.kernel_X
+    
+    def return_mixed_term(self,data, forces:np.ndarray, friction:np.float):
+
+        sigma = self._kernel.length_scale
+        
+        X, Y_fit = contexts_to_markov_train_states(data, self.lookback_len)
+        X = X.reshape(X.shape[0],-1)
+        kern=self._kernel(X,X)
+        forces, Y_fit = contexts_to_markov_train_states(forces, self.lookback_len)
+        forces = forces.reshape(forces.shape[0],-1)
+        difference = (X[:, np.newaxis, :] - X[np.newaxis, :, :])
+        n =  difference.shape[2]
+
+        dk=  (np.einsum('ik,ijk->ij', -forces, difference)/sigma**2 + 0.5*friction * np.einsum('ijk->ij', difference**2)/sigma**4 - friction * n *0.5 / sigma**2) * self.kernel_X        #return self.gaussianG00G10(X,forces,friction,sigma)*self.kernel_X
+
+        return dk
+    
+    
+    def compute_prediction(self,index,train_data, t, bin_edge1, bin_edge2):
+        evs, ul, ur = dual.estimator_eig(
+                self.U, self.V, self.kernel_X, self.kernel_YX
+        )
+        n = self.kernel_YX.shape[0]
+
+        dphi = self.kernel_YX[index]
+        uv_t = (self.U@ur).T
+
+        h = self.kernel_YX[index]
+
+        interval = np.where(np.logical_and(train_data > bin_edge1, train_data < bin_edge2), 1 ,0)
+        s_identity = interval[:,0] / np.sqrt(n)
+
+        g = (V@ul).T @ s_identity
+    #print(np.exp(evs*t))
+        pred = ((np.exp(evs*t) * (g*h)).sum(axis=-1))
+        return pred
+
+    
